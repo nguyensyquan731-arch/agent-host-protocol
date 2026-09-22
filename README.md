@@ -1,4 +1,4 @@
-# Agent Host Protocol
+    # Agent Host Protocol
 
 A synchronized, multi-client state protocol for AI agent sessions.
 

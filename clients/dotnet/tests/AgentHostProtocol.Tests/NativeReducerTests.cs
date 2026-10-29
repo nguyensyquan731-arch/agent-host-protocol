@@ -12,6 +12,7 @@
 
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using Microsoft.AgentHostProtocol;
 using Xunit;
 
@@ -175,6 +176,42 @@ public sealed class NativeReducerTests
             Activity = "running a tool",
         });
         Assert.False(Reducers.IsClientDispatchable(action));
+    }
+
+    [Fact]
+    public void ClientDispatchable_TrueForChatIsArchivedChanged()
+    {
+        var action = new StateAction(new ChatIsArchivedChangedAction
+        {
+            Type = ActionType.ChatIsArchivedChanged,
+            IsArchived = true,
+        });
+        Assert.True(Reducers.IsClientDispatchable(action));
+    }
+
+    [Fact]
+    public void ClientDispatchable_TrueForChatIsReadChanged()
+    {
+        var action = new StateAction(new ChatIsReadChangedAction
+        {
+            Type = ActionType.ChatIsReadChanged,
+            IsRead = true,
+        });
+        Assert.True(Reducers.IsClientDispatchable(action));
+    }
+
+    [Fact]
+    public void ClientDispatchable_TrueForChatConfigChanged()
+    {
+        var action = new StateAction(new ChatConfigChangedAction
+        {
+            Type = ActionType.ChatConfigChanged,
+            Config = new Dictionary<string, JsonElement>
+            {
+                ["autoApprove"] = JsonDocument.Parse("true").RootElement,
+            },
+        });
+        Assert.True(Reducers.IsClientDispatchable(action));
     }
 
     // AHP 0.6.0 (#328): changeset/filesReviewChanged is the first client-dispatchable

@@ -16,6 +16,7 @@ import {
 import fs from 'fs';
 import path from 'path';
 import { findProtocolSourceFiles } from './find-protocol-sources.js';
+import { getDocumentation } from './read-stability.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -30,9 +31,14 @@ interface JsonSchema {
   required?: string[];
   additionalProperties?: boolean | JsonSchema;
   items?: JsonSchema;
+  contains?: JsonSchema;
+  minContains?: number;
+  maxContains?: number;
   enum?: Array<string | number | boolean>;
   const?: string | number | boolean;
   minimum?: number;
+  maximum?: number;
+  minLength?: number;
   oneOf?: JsonSchema[];
   allOf?: JsonSchema[];
   anyOf?: JsonSchema[];
@@ -51,9 +57,7 @@ function normalizeDescription(text: string): string {
 }
 
 function getPropertyDescription(prop: PropertySignature): string {
-  const jsDocs = prop.getJsDocs();
-  if (jsDocs.length === 0) return '';
-  return normalizeDescription(jsDocs[0].getDescription());
+  return getDocumentation(prop);
 }
 
 function hasPropertyTag(prop: PropertySignature, tagName: string): boolean {
@@ -78,10 +82,45 @@ function getNumericPropertyTag(prop: PropertySignature, tagName: string): number
   return value;
 }
 
+function getUniqueItemsByConstraints(prop: PropertySignature): JsonSchema[] | undefined {
+  const tag = prop.getJsDocs()
+    .flatMap(doc => doc.getTags())
+    .find(candidate => candidate.getTagName() === 'uniqueItemsBy');
+  if (!tag) return undefined;
+
+  const key = tag.getCommentText()?.trim();
+  const itemType = prop.getType().getNonNullableType().getArrayElementType();
+  if (!key || !itemType) {
+    throw new Error(
+      `${prop.getSourceFile().getFilePath()}: ${prop.getName()} requires an array and a discriminant for @uniqueItemsBy`,
+    );
+  }
+  const variants = itemType.isUnion() ? itemType.getUnionTypes() : [itemType];
+  const values = variants.map(variant => {
+    const discriminant = variant.getProperty(key);
+    const value = discriminant?.getTypeAtLocation(prop).getLiteralValue();
+    if (!discriminant || discriminant.isOptional() || (typeof value !== 'string' && typeof value !== 'number')) {
+      throw new Error(
+        `${prop.getSourceFile().getFilePath()}: ${prop.getName()} @uniqueItemsBy ${key} requires a required literal discriminant on every array variant`,
+      );
+    }
+    return value;
+  });
+
+  // uniqueItems compares whole objects; count each discriminant instead.
+  return [...new Set(values)].map(value => ({
+    contains: {
+      type: 'object',
+      properties: { [key]: { const: value } },
+      required: [key],
+    },
+    minContains: 0,
+    maxContains: 1,
+  }));
+}
+
 function getInterfaceDescription(node: InterfaceDeclaration): string {
-  const jsDocs = node.getJsDocs();
-  if (jsDocs.length === 0) return '';
-  return normalizeDescription(jsDocs[0].getDescription());
+  return getDocumentation(node);
 }
 
 function getPropertyType(prop: PropertySignature): string {
@@ -367,14 +406,29 @@ function interfaceToSchema(iface: InterfaceDeclaration, project: Project): JsonS
       }
       propSchema.type = 'integer';
     }
-    const minimum = getNumericPropertyTag(prop, 'minimum');
-    if (minimum !== undefined) {
-      if (propSchema.type !== 'number' && propSchema.type !== 'integer') {
+    for (const constraint of ['minimum', 'maximum'] as const) {
+      const value = getNumericPropertyTag(prop, constraint);
+      if (value !== undefined) {
+        if (propSchema.type !== 'number' && propSchema.type !== 'integer') {
+          throw new Error(
+            `${prop.getSourceFile().getFilePath()}: ${name} uses a numeric schema constraint on ${typeText}`,
+          );
+        }
+        propSchema[constraint] = value;
+      }
+    }
+    const minLength = getNumericPropertyTag(prop, 'minLength');
+    if (minLength !== undefined) {
+      if (propSchema.type !== 'string' || !Number.isInteger(minLength) || minLength < 0) {
         throw new Error(
-          `${prop.getSourceFile().getFilePath()}: ${name} uses a numeric schema constraint on ${typeText}`,
+          `${prop.getSourceFile().getFilePath()}: ${name} uses invalid @minLength on ${typeText}`,
         );
       }
-      propSchema.minimum = minimum;
+      propSchema.minLength = minLength;
+    }
+    const uniqueItemsBy = getUniqueItemsByConstraints(prop);
+    if (uniqueItemsBy) {
+      propSchema.allOf = uniqueItemsBy;
     }
     schema.properties![name] = propSchema;
     if (!prop.hasQuestionToken() && !typeAdmitsUndefined(typeText)) {
@@ -558,6 +612,20 @@ function generateCommandsSchema(project: Project): JsonSchema {
     schema.$defs![name] = interfaceToSchema(iface, project);
   }
 
+  // Add command type aliases (e.g. ChatSource and ChatMoveDestination).
+  for (const commandSf of findProtocolSourceFiles(project, 'commands.ts')) {
+    for (const ta of commandSf.getTypeAliases()) {
+      const name = ta.getName();
+      const typeText = ta.getTypeNode()?.getText() || '';
+      schema.$defs![name] = typeTextToSchema(typeText, project);
+      const rawDesc = ta.getJsDocs()[0]?.getDescription();
+      const desc = rawDesc ? normalizeDescription(rawDesc) : '';
+      if (desc) {
+        schema.$defs![name].description = desc;
+      }
+    }
+  }
+
   // Add referenced types from state.ts and actions.ts
   for (const file of ['state.ts', 'actions.ts']) {
     const ifaces = collectInterfacesFromFile(project, file);
@@ -655,6 +723,7 @@ function collectRefTargets(node: JsonSchema | undefined, acc: Set<string>): void
     if (m) acc.add(m[1]);
   }
   if (node.items) collectRefTargets(node.items, acc);
+  if (node.contains) collectRefTargets(node.contains, acc);
   if (node.additionalProperties && typeof node.additionalProperties === 'object') {
     collectRefTargets(node.additionalProperties as JsonSchema, acc);
   }

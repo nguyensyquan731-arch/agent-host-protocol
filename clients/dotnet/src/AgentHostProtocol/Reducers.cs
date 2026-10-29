@@ -91,6 +91,14 @@ public static class Reducers
     // the shared base). Unknown future kinds are preserved as a raw JsonElement
     // by the union converter — read the id structurally so forward-compat entries
     // still upsert/remove correctly.
+    private static string BackgroundWorkId(BackgroundWork work) => work.Value switch
+    {
+        BackgroundShellWork v => v.Id,
+        BackgroundSubagentWork v => v.Id,
+        JsonElement e when e.TryGetProperty("id", out JsonElement id) => id.GetString() ?? string.Empty,
+        _ => string.Empty,
+    };
+
     private static string SessionInputRequestId(SessionInputRequest req) => req.Value switch
     {
         SessionChatInputRequest v => v.Id,
@@ -638,7 +646,7 @@ public static class Reducers
         return ReduceOutcome.OutOfScope;
     }
 
-    // Shared config merge for the root and session `configChanged` actions:
+    // Shared config merge for the root, session, and chat `configChanged` actions:
     // when `replace` is set (or no values exist yet) start fresh, otherwise
     // mutate the existing map in place; then overlay the incoming entries.
     private static Dictionary<string, JsonElement> MergeConfig(
@@ -868,6 +876,17 @@ public static class Reducers
                     mcp.State = new McpServerState(new McpServerStartingState { Kind = McpServerStatus.Starting });
                     mcp.Channel = null;
                 });
+            case SessionMcpServerBackgroundRequestedAction a:
+                return UpdateMcpServerCustomization(state, a.Id, mcp =>
+                {
+                    if (mcp.State.Value is not McpServerStartingState { Blocking: true } starting)
+                    {
+                        return false;
+                    }
+
+                    mcp.State = new McpServerState(starting with { Blocking = false });
+                    return true;
+                });
             case SessionMcpServerStopRequestedAction a:
                 return UpdateMcpServerCustomization(state, a.Id, mcp =>
                 {
@@ -880,6 +899,8 @@ public static class Reducers
                 return ApplySessionChatRemoved(state, a);
             case SessionChatUpdatedAction a:
                 return ApplySessionChatUpdated(state, a);
+            case SessionChatsReorderedAction a:
+                return ApplySessionChatsReordered(state, a);
             case SessionDefaultChatChangedAction a:
                 state.DefaultChat = a.DefaultChat;
                 return ReduceOutcome.Applied;
@@ -957,6 +978,42 @@ public static class Reducers
                 return ReduceOutcome.Applied;
             case ChatActivityChangedAction a:
                 state.Activity = a.Activity;
+                return ReduceOutcome.Applied;
+            case ChatBackgroundWorkSetAction a:
+                {
+                    string workId = BackgroundWorkId(a.Work);
+                    state.BackgroundWork ??= new List<BackgroundWork>();
+                    int idx = state.BackgroundWork.FindIndex(w => BackgroundWorkId(w) == workId);
+                    if (idx < 0)
+                    {
+                        state.BackgroundWork.Add(a.Work);
+                    }
+                    else
+                    {
+                        state.BackgroundWork[idx] = a.Work;
+                    }
+
+                    return ReduceOutcome.Applied;
+                }
+            case ChatBackgroundWorkRemovedAction a:
+                {
+                    int idx = state.BackgroundWork?.FindIndex(w => BackgroundWorkId(w) == a.Id) ?? -1;
+                    if (idx < 0)
+                    {
+                        return ReduceOutcome.NoOp;
+                    }
+
+                    state.BackgroundWork!.RemoveAt(idx);
+                    return ReduceOutcome.Applied;
+                }
+            case ChatMovableChangedAction a:
+                state.Movable = a.Movable;
+                return ReduceOutcome.Applied;
+            case ChatChangesetsChangedAction a:
+                state.Changesets = CopyList(a.Changesets);
+                return ReduceOutcome.Applied;
+            case ChatCanvasesChangedAction a:
+                state.Canvases = CopyList(a.Canvases);
                 return ReduceOutcome.Applied;
             case ChatWorkingDirectorySetAction a:
                 {
@@ -1075,6 +1132,28 @@ public static class Reducers
                 return ApplyChatQueuedMessagesReordered(state, a);
             case ChatDraftChangedAction a:
                 state.Draft = a.Draft;
+                return ReduceOutcome.Applied;
+            case ChatIsReadChangedAction a:
+                state.Status = WithStatusFlag(state.Status, SessionStatus.IsRead, a.IsRead);
+                return ReduceOutcome.Applied;
+            case ChatIsArchivedChangedAction a:
+                state.Status = WithStatusFlag(state.Status, SessionStatus.IsArchived, a.IsArchived);
+                return ReduceOutcome.Applied;
+            case ChatConfigChangedAction a:
+                Dictionary<string, JsonElement> chatValues = MergeConfig(state.Config?.Values, a.Config, a.Replace);
+                state.Config ??= new ChatConfigState { Values = chatValues };
+                state.Config.Values = chatValues;
+                return ReduceOutcome.Applied;
+            case ChatMovedAction a:
+                state.Provider = a.Provider;
+                if (state.Config is not null)
+                {
+                    state.Config.Schema = a.Schema;
+                }
+                else if (a.Schema is not null)
+                {
+                    state.Config = new ChatConfigState { Schema = a.Schema, Values = new Dictionary<string, JsonElement>() };
+                }
                 return ReduceOutcome.Applied;
         }
 
@@ -1675,61 +1754,46 @@ public static class Reducers
 
     private static ReduceOutcome ApplyChatPendingMessageSet(ChatState state, ChatPendingMessageSetAction a)
     {
-        var entry = new PendingMessage { Id = a.Id, Message = a.Message };
-        switch (a.Kind)
+        var entry = new PendingMessage { Id = a.Id, Kind = a.Kind, Message = a.Message };
+        if (a.Kind == PendingMessageKind.Steering)
         {
-            case PendingMessageKind.Steering:
-                state.SteeringMessage = entry;
-                break;
-            case PendingMessageKind.Queued:
-                List<PendingMessage> list = state.QueuedMessages ?? new List<PendingMessage>();
-                int idx = list.FindIndex(m => m.Id == entry.Id);
-                if (idx >= 0)
-                {
-                    list[idx] = entry;
-                }
-                else
-                {
-                    list.Add(entry);
-                }
-
-                state.QueuedMessages = list;
-                break;
+            state.SteeringMessage = entry;
         }
-
+        else if (state.SteeringMessage?.Id == a.Id)
+        {
+            state.SteeringMessage = null;
+        }
+        var list = state.QueuedMessages ?? new List<PendingMessage>();
+        int idx = list.FindIndex(m => m.Id == entry.Id);
+        if (idx < 0)
+        {
+            list.Add(entry);
+        }
+        else
+        {
+            list[idx] = entry;
+        }
+        state.QueuedMessages = list;
         return ReduceOutcome.Applied;
     }
 
     private static ReduceOutcome ApplyChatPendingMessageRemoved(ChatState state, ChatPendingMessageRemovedAction a)
     {
-        switch (a.Kind)
+        var outcome = ReduceOutcome.NoOp;
+        if (a.Kind == PendingMessageKind.Steering && state.SteeringMessage?.Id == a.Id)
         {
-            case PendingMessageKind.Steering:
-                if (state.SteeringMessage is not null && state.SteeringMessage.Id == a.Id)
-                {
-                    state.SteeringMessage = null;
-                    return ReduceOutcome.Applied;
-                }
-
-                return ReduceOutcome.NoOp;
-            case PendingMessageKind.Queued:
-                List<PendingMessage>? list = state.QueuedMessages;
-                if (list is null)
-                {
-                    return ReduceOutcome.NoOp;
-                }
-
-                int removed = list.RemoveAll(m => m.Id == a.Id);
-                if (removed == 0)
-                {
-                    return ReduceOutcome.NoOp;
-                }
-
-                state.QueuedMessages = list.Count == 0 ? null : list;
-                return ReduceOutcome.Applied;
+            state.SteeringMessage = null;
+            outcome = ReduceOutcome.Applied;
         }
-
-        return ReduceOutcome.NoOp;
+        var list = state.QueuedMessages;
+        int idx = list?.FindIndex(m => m.Id == a.Id && (m.Kind ?? PendingMessageKind.Queued) == a.Kind) ?? -1;
+        if (list is null || idx < 0)
+        {
+            return outcome;
+        }
+        list.RemoveAt(idx);
+        state.QueuedMessages = list.Count == 0 ? null : list;
+        return ReduceOutcome.Applied;
     }
 
     private static ReduceOutcome ApplyChatQueuedMessagesReordered(ChatState state, ChatQueuedMessagesReorderedAction a)
@@ -1817,6 +1881,7 @@ public static class Reducers
         if (ch.Status is not null) { s.Status = ch.Status.Value; }
         if (ch.Activity is not null) { s.Activity = ch.Activity; }
         if (ch.ModifiedAt is not null) { s.ModifiedAt = ch.ModifiedAt; }
+        if (ch.Changes is not null) { s.Changes = ch.Changes; }
         if (ch.Origin is not null) { s.Origin = ch.Origin; }
         if (ch.Interactivity is not null) { s.Interactivity = ch.Interactivity; }
         if (ch.WorkingDirectories is not null) { s.WorkingDirectories = ch.WorkingDirectories; }
@@ -1825,6 +1890,47 @@ public static class Reducers
         // removed it, re-expressing the primary as `WorkingDirectories[0]` under
         // `MultipleWorkingDirectoriesCapability.ImmutablePrimary`. The set itself is
         // merged above, as the rust, go, kotlin, and swift clients also do.
+        return ReduceOutcome.Applied;
+    }
+
+    private static ReduceOutcome ApplySessionChatsReordered(SessionState state, SessionChatsReorderedAction a)
+    {
+        if (a.Chats.Count != state.Chats.Count || new HashSet<string>(a.Chats).Count != state.Chats.Count)
+        {
+            return ReduceOutcome.NoOp;
+        }
+
+        bool unchanged = true;
+        for (int i = 0; i < a.Chats.Count; i++)
+        {
+            if (a.Chats[i] != state.Chats[i].Resource)
+            {
+                unchanged = false;
+                break;
+            }
+        }
+        if (unchanged)
+        {
+            return ReduceOutcome.NoOp;
+        }
+
+        Dictionary<string, ChatSummary> summaries = new(state.Chats.Count);
+        foreach (ChatSummary summary in state.Chats)
+        {
+            summaries[summary.Resource] = summary;
+        }
+        List<ChatSummary> reordered = new(a.Chats.Count);
+        foreach (string resource in a.Chats)
+        {
+            if (!summaries.TryGetValue(resource, out ChatSummary? summary))
+            {
+                return ReduceOutcome.NoOp;
+            }
+
+            reordered.Add(summary);
+        }
+
+        state.Chats = reordered;
         return ReduceOutcome.Applied;
     }
 
@@ -1924,14 +2030,30 @@ public static class Reducers
     /// to it in place. Mirrors the canonical TypeScript
     /// <c>updateMcpServerCustomization</c> helper shared by
     /// <c>session/mcpServerStateChanged</c>, <c>session/mcpServerStartRequested</c>,
-    /// and <c>session/mcpServerStopRequested</c>. Returns
+    /// <c>session/mcpServerStopRequested</c>, and
+    /// <c>session/mcpServerBackgroundRequested</c>. Returns
     /// <see cref="ReduceOutcome.NoOp"/> when no matching MCP server is found (or the
     /// id targets a non-MCP customization).
     /// </summary>
     private static ReduceOutcome UpdateMcpServerCustomization(
         SessionState state,
         string id,
-        Action<McpServerCustomization> update)
+        Action<McpServerCustomization> update) =>
+        UpdateMcpServerCustomization(state, id, mcp =>
+        {
+            update(mcp);
+            return true;
+        });
+
+    /// <summary>
+    /// Variant of <see cref="UpdateMcpServerCustomization(SessionState, string, Action{McpServerCustomization})"/>
+    /// whose <paramref name="update"/> returns whether it changed the entry, so a
+    /// conditional update can report <see cref="ReduceOutcome.NoOp"/>.
+    /// </summary>
+    private static ReduceOutcome UpdateMcpServerCustomization(
+        SessionState state,
+        string id,
+        Func<McpServerCustomization, bool> update)
     {
         List<Customization>? list = state.Customizations;
         if (list is null)
@@ -1947,8 +2069,7 @@ public static class Reducers
         {
             if (c.Value is McpServerCustomization top && top.Id == id)
             {
-                update(top);
-                return ReduceOutcome.Applied;
+                return update(top) ? ReduceOutcome.Applied : ReduceOutcome.NoOp;
             }
 
             // A non-MCP top-level customization that carries the id is a no-op
@@ -1972,8 +2093,7 @@ public static class Reducers
             {
                 if (child.Value is McpServerCustomization mcp && mcp.Id == id)
                 {
-                    update(mcp);
-                    return ReduceOutcome.Applied;
+                    return update(mcp) ? ReduceOutcome.Applied : ReduceOutcome.NoOp;
                 }
 
                 if (TryChildCustomizationId(child, out string childGot) && childGot == id)
@@ -1985,6 +2105,26 @@ public static class Reducers
         }
 
         return ReduceOutcome.NoOp;
+    }
+
+    /// <summary>Replaces live canvas state or returns OutOfScope.</summary>
+    public static ReduceOutcome ApplyToCanvas(CanvasState state, StateAction action)
+    {
+        Guard.ThrowIfNull(state, nameof(state));
+        Guard.ThrowIfNull(action, nameof(action));
+        if (action.Value is not CanvasStateChangedAction a)
+        {
+            return ReduceOutcome.OutOfScope;
+        }
+
+        state.InstanceId = a.Canvas.InstanceId;
+        state.ExtensionId = a.Canvas.ExtensionId;
+        state.ExtensionName = a.Canvas.ExtensionName;
+        state.CanvasId = a.Canvas.CanvasId;
+        state.Title = a.Canvas.Title;
+        state.Status = a.Canvas.Status;
+        state.Url = a.Canvas.Url;
+        return ReduceOutcome.Applied;
     }
 
     // ─── Terminal Reducer ──────────────────────────────────────────────────
@@ -2453,6 +2593,9 @@ public static class Reducers
         "chat/pendingMessageRemoved",
         "chat/queuedMessagesReordered",
         "chat/draftChanged",
+        "chat/isReadChanged",
+        "chat/isArchivedChanged",
+        "chat/configChanged",
         "chat/inputAnswerChanged",
         "chat/inputCompleted",
         "chat/truncated",
@@ -2463,6 +2606,7 @@ public static class Reducers
         "session/customizationToggled",
         "session/mcpServerStartRequested",
         "session/mcpServerStopRequested",
+        "session/mcpServerBackgroundRequested",
         "session/isReadChanged",
         "session/isArchivedChanged",
         "session/configChanged",
